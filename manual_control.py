@@ -561,7 +561,7 @@ class KeyboardControl(object):
                 elif event.key == pygame.K_e:
                     self.engine_on = not self.engine_on
                     if not self.engine_on:
-                        self.on_engine_off(world)
+                        print(self.on_engine_off(world))
                     else:
                         world.hud.notification('Engine ON!')
 
