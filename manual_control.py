@@ -61,10 +61,13 @@ from __future__ import print_function
 # -- find carla module ---------------------------------------------------------
 # ==============================================================================
 
-
+import uuid
 import glob
 import os
 import sys
+import json
+import asyncio
+from custom.mqtt_publisher import MQTTPublisher
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -72,11 +75,6 @@ try:
         sys.version_info.minor,
         'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
 except IndexError:
-    pass
-
-try:
-    sys.path.append('C:\\Users\\user\\Downloads\\CARLA_0.9.15\\WindowsNoEditor\\PythonAPI\\carla\\dist\\carla-0.9.15-py3.7-win-amd64.egg')
-except:
     pass
 
 
@@ -111,7 +109,6 @@ try:
     from pygame.locals import K_DOWN
     from pygame.locals import K_ESCAPE
     from pygame.locals import K_F1
-    from pygame.locals import K_F2
     from pygame.locals import K_LEFT
     from pygame.locals import K_PERIOD
     from pygame.locals import K_RIGHT
@@ -123,7 +120,6 @@ try:
     from pygame.locals import K_b
     from pygame.locals import K_c
     from pygame.locals import K_d
-    from pygame.locals import K_e
     from pygame.locals import K_f
     from pygame.locals import K_g
     from pygame.locals import K_h
@@ -150,22 +146,6 @@ try:
     import numpy as np
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
-
-import time
-import math
-import numpy as np
-import pygame
-
-
-# 각도 차이 계산 함수 추가 (클래스 외부에 정의)
-def angle_diff(angle1, angle2):
-    """Calculates the absolute difference between two angles in degrees, handling wrapping."""
-    diff = angle1 - angle2
-    while diff <= -180:
-        diff += 360
-    while diff > 180:
-        diff -= 360
-    return abs(diff)
 
 
 # ==============================================================================
@@ -215,9 +195,10 @@ def get_actor_blueprints(world, filter, generation):
 
 
 class World(object):
-    def __init__(self, carla_world, hud, args, client): # Add client parameter
+    global event_producer, mqtt_publisher, iot_publisher
+
+    def __init__(self, carla_world, hud, args):
         self.world = carla_world
-        self.client = client # Store the client object
         self.sync = args.sync
         self.actor_role_name = args.rolename
         try:
@@ -229,8 +210,15 @@ class World(object):
             sys.exit(1)
         self.hud = hud
         self.player = None
+        self.collision_log = []
+        self.invasion_log = []
+        self.obstacle_log = []
+        self.collision_cnt = 0
+        self.invasion_cnt = 0
+        self.obstacle_cnt = 0
         self.collision_sensor = None
         self.lane_invasion_sensor = None
+        self.obstacle_sensor = None
         self.gnss_sensor = None
         self.imu_sensor = None
         self.radar_sensor = None
@@ -261,8 +249,6 @@ class World(object):
             carla.MapLayer.Walls,
             carla.MapLayer.All
         ]
-        self.analytics = DrivingAnalytics()
-        self.show_analytics_dashboard = False
 
     def restart(self):
         self.player_max_speed = 1.589
@@ -312,8 +298,9 @@ class World(object):
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
         # Set up the sensors.
-        self.collision_sensor = CollisionSensor(self.player, self.hud)
-        self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
+        self.collision_sensor = CollisionSensor(self.player, self.hud, self.collision_log)
+        self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud, self.invasion_log)
+        self.obstacle_sensor = ObstacleSensor(self.player, self.hud, self.obstacle_log)
         self.gnss_sensor = GnssSensor(self.player)
         self.imu_sensor = IMUSensor(self.player)
         self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
@@ -367,25 +354,10 @@ class World(object):
 
     def tick(self, clock):
         self.hud.tick(self, clock)
-        
-        # 분석 데이터 수집
-        if self.player is not None:
-            self.analytics.collect_data(self.player, self.hud.simulation_time)
 
     def render(self, display):
-        # Always render the camera view first
-        if self.camera_manager is not None and self.camera_manager.surface is not None:
-            self.camera_manager.render(display)
-        else:
-            # Optional: Draw a black background or placeholder if camera isn't ready
-            display.fill((0, 0, 0)) 
-
-        # Then render either the HUD or the safety dashboard on top
-        if self.show_analytics_dashboard:
-            self.render_safety_dashboard(display)
-        else:
-            if self.hud is not None:
-                self.hud.render(display)
+        self.camera_manager.render(display)
+        self.hud.render(display)
 
     def destroy_sensors(self):
         self.camera_manager.sensor.destroy()
@@ -408,457 +380,112 @@ class World(object):
         if self.player is not None:
             self.player.destroy()
 
-    def spawn_traffic_vehicles(self, number_of_vehicles):
-        """Spawn traffic vehicles in available spawn points."""
-        if number_of_vehicles <= 0:
-            return []
-            
-        self.hud.notification(f"Spawning {number_of_vehicles} traffic vehicles...")
-        
-        # Traffic Manager 설정 (client 객체 사용)
-        traffic_manager = self.client.get_trafficmanager() # Use self.client
-        traffic_manager.set_global_distance_to_leading_vehicle(2.5)
-        
-        # 스폰 포인트 가져오기
-        spawn_points = self.map.get_spawn_points()
-        random.shuffle(spawn_points)
-        
-        # 차량 블루프린트 가져오기
-        blueprints = get_actor_blueprints(self.world, 'vehicle.*', self._actor_generation)
-        
-        # 경찰차 등 특수 차량 제외 (선택사항)
-        blueprints = [bp for bp in blueprints if not bp.id.startswith('vehicle.bh.') and 
-                      not bp.id.startswith('vehicle.police.')]
-                      
-        vehicles_list = []
-        for i in range(min(number_of_vehicles, len(spawn_points))):
-            blueprint = random.choice(blueprints)
-            transform = spawn_points[i]
-            vehicle = self.world.try_spawn_actor(blueprint, transform)
-            if vehicle is not None:
-                vehicles_list.append(vehicle)
-                vehicle.set_autopilot(True)
-                traffic_manager.ignore_lights_percentage(vehicle, 100)
-                traffic_manager.ignore_signs_percentage(vehicle, 100)
-        
-        self.hud.notification(f"Spawned {len(vehicles_list)} traffic vehicles.")
-        return vehicles_list
-
-    def render_safety_dashboard(self, display):
-        """안전 운전 점수 대시보드 렌더링 (안전거리 점수 추가)"""
-        if not self.show_analytics_dashboard:
-            return
-
-        # 분석 결과 가져오기
-        results = self.analytics.get_results()
-
-        # 반투명 배경
-        dashboard_surface = pygame.Surface((self.hud.dim[0], self.hud.dim[1]))
-        dashboard_surface.set_alpha(220)
-        dashboard_surface.fill((0, 0, 0))
-
-        # 제목
-        font_large = pygame.font.Font(pygame.font.get_default_font(), 32)
-        text_title = font_large.render("Safety Driving Dashboard", True, (255, 255, 255))
-        dashboard_surface.blit(text_title, (self.hud.dim[0]//2 - text_title.get_width()//2, 50))
-
-        # 최종 안전 점수 표시
-        score_color = (0, 255, 0) if results['safety_score'] >= 70 else (255, 165, 0) if results['safety_score'] >= 40 else (255, 0, 0)
-        text_score = font_large.render(f"Safety Score: {results['safety_score']:.1f}", True, score_color)
-        dashboard_surface.blit(text_score, (self.hud.dim[0]//2 - text_score.get_width()//2, 120))
-
-        # 항목별 점수 및 정보
-        font_med = pygame.font.Font(pygame.font.get_default_font(), 24)
-        y_offset = 200
-        col1_x = self.hud.dim[0] // 2 - 300 # 간격 조정
-        col2_x = self.hud.dim[0] // 2 + 100 # 간격 조정
-
-        # 가속/감속 점수
-        accel_score_text = font_med.render(f"Accel/Decel Score: {results['score_accel_decel']:.1f}", True, (255, 255, 255))
-        dashboard_surface.blit(accel_score_text, (col1_x, y_offset))
-        # 가속/감속 횟수
-        accel_count_text = font_med.render(f"Events (A/B): {results['count_a_accel_decel']} / {results['count_b_accel_decel']}", True, (200, 200, 200))
-        dashboard_surface.blit(accel_count_text, (col2_x, y_offset))
-        y_offset += 40
-
-        # 급회전 점수
-        turn_score_text = font_med.render(f"Sharp Turn Score: {results['score_sharp_turn']:.1f}", True, (255, 255, 255))
-        dashboard_surface.blit(turn_score_text, (col1_x, y_offset))
-        # 급회전 횟수
-        turn_count_text = font_med.render(f"Events (A/B): {results['count_a_sharp_turn']} / {results['count_b_sharp_turn']}", True, (200, 200, 200))
-        dashboard_surface.blit(turn_count_text, (col2_x, y_offset))
-        y_offset += 40
-
-        # 과속 점수
-        speed_score_text = font_med.render(f"Speeding Score: {results['score_speeding']:.1f}", True, (255, 255, 255))
-        dashboard_surface.blit(speed_score_text, (col1_x, y_offset))
-        # 과속 시간
-        speed_dur_text = font_med.render(f"Duration: {results['speeding_duration']:.1f}s", True, (200, 200, 200))
-        dashboard_surface.blit(speed_dur_text, (col2_x, y_offset))
-        y_offset += 40
-
-        # 안전거리 유지 점수
-        safe_dist_score_text = font_med.render(f"Safe Distance Score: {results['safe_distance_score']:.1f}", True, (255, 255, 255))
-        dashboard_surface.blit(safe_dist_score_text, (col1_x, y_offset))
-        # 안전거리 위반 횟수
-        safe_dist_violation_text = font_med.render(f"Violations: {results['safe_distance_violations']} times", True, (200, 200, 200))
-        dashboard_surface.blit(safe_dist_violation_text, (col2_x, y_offset))
-        y_offset += 40
-
-        # 운전 시간
-        duration_mins = int(results['driving_duration'] // 60)
-        duration_secs = int(results['driving_duration'] % 60)
-        time_text = font_med.render(f"Total Driving Time: {duration_mins}m {duration_secs}s", True, (255, 255, 255))
-        dashboard_surface.blit(time_text, (col1_x, y_offset))
-        y_offset += 70
-
-        # 안내 메시지
-        font_small = pygame.font.Font(pygame.font.get_default_font(), 20)
-        hint_text = font_small.render("Press ESC to exit", True, (200, 200, 200))
-        dashboard_surface.blit(hint_text, (self.hud.dim[0]//2 - hint_text.get_width()//2, y_offset))
-
-        # 그래프 위치 조정 (기존 히스토그램 아래 또는 옆)
-        graph_x = self.hud.dim[0] // 2 - 300
-        graph_y = y_offset + 50 # 예시 위치, 필요시 조정
-        graph_width = 600
-        graph_height = 150
-        self.render_accel_decel_trend_graph(dashboard_surface, graph_x, graph_y, graph_width, graph_height)
-
-        display.blit(dashboard_surface, (0, 0))
-
-    def render_accel_decel_trend_graph(self, surface, x, y, width, height):
-        """구간별 급가감속 빈도율 꺾은선 그래프 렌더링"""
-        rates = self.analytics.get_results().get('binned_accel_decel_rates', [])
-        if not rates or len(rates) != 10:
-            # 데이터가 없거나 형식이 맞지 않으면 그리지 않음
-            font = pygame.font.Font(pygame.font.get_default_font(), 16)
-            text = font.render("Trend data not available", True, (150, 150, 150))
-            surface.blit(text, (x + width//2 - text.get_width()//2, y + height//2 - text.get_height()//2))
-            return
-
-        # 그래프 영역 배경 및 테두리
-        pygame.draw.rect(surface, (30, 30, 30), (x, y, width, height))
-        pygame.draw.rect(surface, (100, 100, 100), (x, y, width, height), 1)
-
-        # 제목
-        font_title = pygame.font.Font(pygame.font.get_default_font(), 18)
-        title = font_title.render("급가감속 빈도율 추세 (분당)", True, (255, 255, 255))
-        surface.blit(title, (x + width//2 - title.get_width()//2, y - 25))
-
-        # 최대 빈도율 계산 (Y축 스케일링용, 최소값 5로 설정)
-        max_rate = max(max(rates), 5.0)
-
-        # X축, Y축 그리기
-        pygame.draw.line(surface, (200, 200, 200), (x, y + height), (x + width, y + height), 1) # X축
-        pygame.draw.line(surface, (200, 200, 200), (x, y), (x, y + height), 1) # Y축
-
-        # Y축 레이블
-        font_small = pygame.font.Font(pygame.font.get_default_font(), 12)
-        max_label = font_small.render(f"{max_rate:.0f}", True, (200, 200, 200))
-        surface.blit(max_label, (x - 20, y))
-        zero_label = font_small.render("0", True, (200, 200, 200))
-        surface.blit(zero_label, (x - 20, y + height - 12))
-
-        # 그래프 포인트 계산
-        points = []
-        num_bins = len(rates)
-        bin_width = width / num_bins
-        for i, rate in enumerate(rates):
-            point_x = x + (i + 0.5) * bin_width # 각 구간의 중간 지점
-            point_y = y + height - (rate / max_rate) * height if max_rate > 0 else y + height
-            points.append((int(point_x), int(point_y)))
-
-        # 꺾은선 그래프 그리기
-        if len(points) > 1:
-            pygame.draw.lines(surface, (0, 200, 200), False, points, 2)
-
-        # 각 포인트에 원 그리기
-        for p in points:
-            pygame.draw.circle(surface, (0, 255, 255), p, 4)
-        
-         # X축 레이블 (구간 표시)
-        for i in range(num_bins):
-            label_text = f"{i*10}-{(i+1)*10}%"
-            label = font_small.render(label_text, True, (200, 200, 200))
-            label_x = x + (i + 0.5) * bin_width - label.get_width() // 2
-            surface.blit(label, (label_x, y + height + 5))
-
-
-
-# ==============================================================================
-# -- DrivingAnalytics ---------------------------------------------------------
-# ==============================================================================
-
-class DrivingAnalytics(object):
-    def __init__(self):
-        self.start_time = time.time()
-        self.end_time = None
-        self.data_points = []
-
-        # 급가속/급감속 카운터
-        self.count_a_accel_decel = 0 # a = |가속도| ≥ 10km/h/s
-        self.count_b_accel_decel = 0 # b = 5 ≤ |가속도| < 10km/h/s
-
-        # 급회전 카운터
-        self.count_a_sharp_turn = 0 # a = 속도 > 30km/h && 회전각속도 > 30도/s
-        self.count_b_sharp_turn = 0 # b = 회전각속도 > 30도/s
-
-        # 과속 관련
-        self.speeding_duration = 0.0 # 속도 ≥ 100km/h 인 총 시간(초)
-
-        # 계산용 임시 변수
-        self.last_velocity_kmh = 0.0
-        self.last_yaw = None
-        self.last_timestamp = time.time()
-
-        # 최종 점수
-        self.score_accel_decel = 100.0
-        self.score_sharp_turn = 100.0
-        self.score_speeding = 100.0
-        self.safety_score = 100.0
-        self.driving_duration = 0.0
-
-        # 이벤트 감지 제한을 위한 시간 변수 추가
-        self.last_accel_event_time = 0
-        self.last_turn_event_time = 0
-
-        # 이벤트 상세 정보 저장 (시간, 유형)
-        self.accel_decel_events = []
-
-        # 10% 구간별 평균 급가감속 빈도율 (분당)
-        self.binned_accel_decel_rates = []
-
-        # 안전 거리 유지 관련 변수 추가
-        self.safe_distance_score = 100.0
-        self.safe_distance_violations = 0
-        self.last_safe_distance_check_time = 0 # 마지막 안전거리 체크 시간
-        self.last_violation_time = 0 # 마지막 위반 감지 시간 (연속 감점 방지용)
-
-    def find_forward_vehicle(self, player, max_distance=120.0):
-        """모든 차량을 확인하여 전방에 있는 가장 가까운 차량 찾기"""
-        world = player.get_world()
-        ego_location = player.get_location()
-        ego_transform = player.get_transform()
-        ego_forward = ego_transform.get_forward_vector()
-
-        # 모든 차량 가져오기
-        vehicles = world.get_actors().filter('vehicle.*')
-
-        closest_distance = max_distance
-        closest_vehicle = None
-
-        for vehicle in vehicles:
-            if vehicle.id == player.id:  # 자기 자신 제외
-                continue
-
-            # 다른 차량까지의 벡터
-            to_vehicle_vector = vehicle.get_location() - ego_location
-
-            # 거리 계산
-            distance = to_vehicle_vector.length()
-
-            # 최대 거리 내에 있고
-            if distance <= max_distance:
-                # 전방에 있는지 확인 (내적이 양수면 전방)
-                dot_product = ego_forward.x * to_vehicle_vector.x + ego_forward.y * to_vehicle_vector.y
-                if dot_product > 0:
-                    # 차선폭(약 3.5m) 내에 있는지 확인 (같은 차선 근사)
-                    # 좀 더 정확하려면 Waypoint API 사용 필요
-                    cross_product = abs(ego_forward.x * to_vehicle_vector.y - ego_forward.y * to_vehicle_vector.x)
-                    if cross_product < 3.5:  # 자차 차선 내 앞차만 고려 (근사치)
-                        if distance < closest_distance:
-                            closest_distance = distance
-                            closest_vehicle = vehicle
-
-        return closest_vehicle, closest_distance
-
-    def collect_data(self, player, timestamp):
-        """주행 데이터 수집 및 실시간 분석 (안전거리 체크 추가)"""
-        current_time = time.time()
-        time_diff = current_time - self.last_timestamp
-        if time_diff <= 0.01: # 너무 짧은 간격은 무시
-            return
-
-        # ... (기존 속도, 회전 등 데이터 수집 로직 유지) ...
-        speed_kmh = 3.6 * math.sqrt(player.get_velocity().x**2 + player.get_velocity().y**2 + player.get_velocity().z**2)
-        rotation = player.get_transform().rotation
-
-        # --- 안전거리 유지 체크 (0.5초마다) ---
-        if current_time - self.last_safe_distance_check_time >= 0.5:
-            self.last_safe_distance_check_time = current_time
-
-            if speed_kmh >= 50:
-                forward_vehicle, distance = self.find_forward_vehicle(player, 120.0)
-
-                if forward_vehicle is not None:
-                    # 안전 거리 기준: 속도(km/h) 값보다 가까울 때
-                    required_safe_distance = speed_kmh
-
-                    if distance < required_safe_distance:
-                        # 위반 발생, 마지막 위반 후 1초 이상 경과 시 감점 (연속 감점 방지)
-                        if current_time - self.last_violation_time >= 1.0:
-                            self.safe_distance_violations += 1
-                            self.safe_distance_score = max(0.0, self.safe_distance_score - 10.0)
-                            self.last_violation_time = current_time
-                            # print(f"안전거리 위반! 거리: {distance:.1f}m, 필요: {required_safe_distance:.1f}m, 점수: {self.safe_distance_score}") # 디버깅용
-
-        # --- 급가속/급감속 감지 (1초에 한 번만) ---
-        acceleration_kmh_s = (speed_kmh - self.last_velocity_kmh) / time_diff if time_diff > 0 else 0.0 # 0으로 나누기 방지 추가
-        abs_accel = abs(acceleration_kmh_s)
-
-        # 마지막 감지 후 1초 이상 경과 시에만 카운트
-        if current_time - self.last_accel_event_time >= 1.0:
-            event_detected = False
-            event_type = None
-            if abs_accel >= 10:
-                self.count_a_accel_decel += 1
-                event_type = 'a'
-                event_detected = True
-                # print(f"급가속/급감속 (A): {acceleration_kmh_s:.1f} km/h/s") # 디버깅용
-            elif 5 <= abs_accel < 10:
-                self.count_b_accel_decel += 1
-                event_type = 'b'
-                event_detected = True
-                # print(f"급가속/급감속 (B): {acceleration_kmh_s:.1f} km/h/s") # 디버깅용
-
-            if event_detected:
-                self.last_accel_event_time = current_time
-                # 이벤트 발생 시 시간과 유형 저장
-                self.accel_decel_events.append({
-                    'time': current_time - self.start_time, # 주행 시작 후 경과 시간
-                    'type': event_type,
-                    'value': acceleration_kmh_s
-                })
-
-        # --- 급회전 감지 (1초에 한 번만) ---
-        if self.last_yaw is not None:
-            yaw_diff = angle_diff(rotation.yaw, self.last_yaw)
-            yaw_rate_deg_s = yaw_diff / time_diff
-
-            # 마지막 감지 후 1초 이상 경과 시에만 카운트
-            if yaw_rate_deg_s > 30 and current_time - self.last_turn_event_time >= 1.0:
-                self.count_b_sharp_turn += 1
-                self.last_turn_event_time = current_time
-                
-                if speed_kmh > 30:
-                    self.count_a_sharp_turn += 1
-
-        # --- 과속 시간 누적 ---
-        if speed_kmh >= 100:
-            self.speeding_duration += time_diff
-            # print(f"과속 중: {speed_kmh:.1f} km/h, 누적 시간: {self.speeding_duration:.1f}s")
-
-        # 다음 계산을 위해 현재 값 저장
-        self.last_velocity_kmh = speed_kmh
-        self.last_yaw = rotation.yaw
-        self.last_timestamp = current_time
-
-    def end_session(self):
-        """주행 세션 종료 및 최종 점수 계산 (안전거리 점수 포함)"""
-        self.end_time = time.time()
-        self.driving_duration = self.end_time - self.start_time
-
-        # --- 구간별 급가감속 빈도율 계산 ---
-        num_bins = 10
-        bin_event_counts = [0] * num_bins
-        self.binned_accel_decel_rates = [0.0] * num_bins # 초기화
-
-        if self.driving_duration > 0:
-            # 각 이벤트가 어느 시간 구간(0-10%, 10-20%...)에 속하는지 계산
-            for event in self.accel_decel_events:
-                relative_time_percent = (event['time'] / self.driving_duration) * 100.0
-                # 퍼센트가 100.0일 경우 마지막 bin 인덱스(9)가 되도록 조정
-                bin_idx = min(num_bins - 1, int(relative_time_percent // (100.0 / num_bins)))
-                bin_event_counts[bin_idx] += 1
-
-            # 각 구간의 지속 시간 (분 단위)
-            bin_duration_minutes = (self.driving_duration / num_bins) / 60.0
-
-            if bin_duration_minutes > 0:
-                # 각 구간의 분당 이벤트 발생 빈도율 계산
-                for i in range(num_bins):
-                    self.binned_accel_decel_rates[i] = bin_event_counts[i] / bin_duration_minutes
-            # else: # 매우 짧은 주행 시간 처리 (이미 0.0으로 초기화됨)
-            #     pass
-        # else: # 주행 시간 0 처리 (이미 0.0으로 초기화됨)
-        #     pass
-
-        # --- 기존 점수 계산 로직 유지 ---
-        # 1. 급가속/급감속 점수
-        total_accel_decel_events = self.count_a_accel_decel + self.count_b_accel_decel
-        if total_accel_decel_events > 0:
-            # 공식: 100 * a / (a + b) -> 위험도 지수? 안전 점수는 100 - (위험도) 로 해석
-            # 혹은 사용자 의도가 '위험 이벤트 비율' 자체를 점수로 보는 것이라면 그대로 사용
-            # 여기서는 사용자 공식을 그대로 따름
-            self.score_accel_decel = 100.0 * self.count_b_accel_decel / total_accel_decel_events
-            # 만약 안전 점수 (낮을수록 좋음)를 원한다면:
-            # self.score_accel_decel = 100.0 - (100.0 * self.count_a_accel_decel / total_accel_decel_events)
-        else:
-            self.score_accel_decel = 100.0 # 이벤트 없으면 만점
-
-        # 2. 급회전 점수
-        if self.count_b_sharp_turn > 0:
-            # 공식: 100 * a / b -> 위험 회전 비율? 안전 점수는 100 - (비율) 로 해석
-            # 여기서는 사용자 공식을 그대로 따름
-            self.score_sharp_turn = 100.0 * self.count_a_sharp_turn / self.count_b_sharp_turn
-            # 만약 안전 점수 (낮을수록 좋음)를 원한다면:
-            # self.score_sharp_turn = 100.0 - (100.0 * self.count_a_sharp_turn / self.count_b_sharp_turn)
-        else:
-            self.score_sharp_turn = 100.0 # 이벤트 없으면 만점
-
-        # 3. 과속 점수
-        speeding_penalty = math.floor(self.speeding_duration / 5.0)
-        self.score_speeding = max(0.0, 100.0 - speeding_penalty)
-
-        # --- 최종 점수 계산 로직 ---
-        # --- 최종 안전 운전 점수 (안전거리 점수 포함) ---
-        # 각 점수가 0~100 범위인지 확인 후 평균 계산
-        # 안전거리 점수도 평균에 포함 (가중치 조절 가능)
-        num_scores = 4 # 가속/감속, 급회전, 과속, 안전거리
-        self.safety_score = (self.score_accel_decel + self.score_sharp_turn + self.score_speeding + self.safe_distance_score) / num_scores
-        self.safety_score = max(0.0, min(100.0, self.safety_score)) # 최종 점수 0~100 범위로 제한
-
-        print("-" * 30)
-        print("주행 분석 결과")
-        print(f"  총 주행 시간: {self.driving_duration:.1f} 초")
-        print(f"  급가속/급감속(A): {self.count_a_accel_decel} 회")
-        print(f"  급가속/급감속(B): {self.count_b_accel_decel} 회")
-        print(f"  급회전(A): {self.count_a_sharp_turn} 회")
-        print(f"  급회전(B): {self.count_b_sharp_turn} 회")
-        print(f"  과속 누적 시간: {self.speeding_duration:.1f} 초")
-        print(f"  안전거리 위반 횟수: {self.safe_distance_violations} 회")
-        print("-" * 30)
-        print(f"  가속/감속 점수: {self.score_accel_decel:.1f}")
-        print(f"  급회전 점수: {self.score_sharp_turn:.1f}")
-        print(f"  과속 점수: {self.score_speeding:.1f}")
-        print(f"  안전거리 점수: {self.safe_distance_score:.1f}")
-        print(f"  최종 안전 점수: {self.safety_score:.1f}")
-        print(f"  구간별 빈도율(분당): {[f'{rate:.1f}' for rate in self.binned_accel_decel_rates]}") # 계산 결과 확인용
-        print("-" * 30)
-
-        return self.get_results()
-
-    def get_results(self):
-        """계산된 분석 결과 반환 (안전거리 점수 포함)"""
-        results = {
-            'driving_duration': self.driving_duration,
-            'count_a_accel_decel': self.count_a_accel_decel,
-            'count_b_accel_decel': self.count_b_accel_decel,
-            'count_a_sharp_turn': self.count_a_sharp_turn,
-            'count_b_sharp_turn': self.count_b_sharp_turn,
-            'speeding_duration': self.speeding_duration,
-            'score_accel_decel': self.score_accel_decel,
-            'score_sharp_turn': self.score_sharp_turn,
-            'score_speeding': self.score_speeding,
-            'safety_score': self.safety_score, # 최종 안전 점수
-            # 구간별 빈도율 데이터 추가
-            'binned_accel_decel_rates': self.binned_accel_decel_rates,
-            # 안전거리 결과 추가
-            'safe_distance_score': self.safe_distance_score,
-            'safe_distance_violations': self.safe_distance_violations
+    def event_log(self, filename):
+
+        if self.collision_cnt < len(self.collision_log):
+            data = {
+                "event": "collision"
+            }
+            self.collision_cnt += 1
+            event_producer.push_queue(data)
+            print("collision")
+
+
+        if self.invasion_cnt < len(self.invasion_log):
+            data = {
+                "event": "invasion"
+            }
+            self.invasion_cnt += 1
+            event_producer.push_queue(data)
+            print("invasion")
+
+    def sensor_log(self, filename):
+        v = self.player.get_velocity()
+        t = self.player.get_transform()
+        c = self.player.get_control()
+
+        data = {
+            "velocity":3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2),
+            'Accelero':self.imu_sensor.accelerometer,
+            'Gyroscop': self.imu_sensor.gyroscope,
+            'Location': (t.location.x, t.location.y),
+            'GNSS': (self.gnss_sensor.lat, self.gnss_sensor.lon),
+            'Height': t.location.z,
+            'Throttle': c.throttle,
+            'Steer': c.steer,
+            'Brake': c.brake,
         }
-        return results
 
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                log = json.load(f)
+        else:
+            log = []
+
+        log.append(data)
+        event_producer.put(data)
+
+        # 덮어쓰기
+        with open(filename, 'w') as f:
+            json.dump(log, f, indent=2)
+
+        # print("")
+        # print("")
+        # print("===========================================")
+        # print("")
+        # print( "velocity: " + str(int(3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2))) )
+        # print( 'Accelero: (%5.1f,%5.1f,%5.1f)' % (self.imu_sensor.accelerometer) )
+        # print( 'Gyroscop: (%5.1f,%5.1f,%5.1f)' % (self.imu_sensor.gyroscope) )
+        # print( 'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)) )
+        # print( 'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (self.gnss_sensor.lat, self.gnss_sensor.lon)) )
+        # print( 'Height:  % 18.0f m' % t.location.z )
+        # print('Throttle:', str(c.throttle))
+        # print('Steer:', str(c.steer))
+        # print('Brake:', str(c.brake))
+
+    def sensor_publish(self, user_id, start_time):
+        v = self.player.get_velocity()
+        t = self.player.get_transform()
+        c = self.player.get_control()
+        
+        
+        data = {
+            "userId": "fd6f1caf-532a-4eeb-b6d5-82ada2689a9d",# user_id,
+            "driveId": "9",# f"{user_id}-{start_time}",
+            "time": datetime.datetime.now().isoformat(),
+            "velocity": 3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2),
+            'Accelero_x': self.imu_sensor.accelerometer[0],
+            'Accelero_y': self.imu_sensor.accelerometer[1],
+            'Accelero_z': self.imu_sensor.accelerometer[2],
+            'Gyroscop_x': self.imu_sensor.gyroscope[0],
+            'Gyroscop_y': self.imu_sensor.gyroscope[1],
+            'Gyroscop_z': self.imu_sensor.gyroscope[2],
+            'GNSS_x': self.gnss_sensor.lat,
+            'GNSS_y': self.gnss_sensor.lon,
+            'Throttle': c.throttle,
+            'Steer': c.steer,
+            'Brake': c.brake,
+            'collision': "",
+            "invasion": "",
+            "front_distance": 0,
+            "front_object": ""
+        }
+
+        if self.collision_cnt < len(self.collision_log):
+            data["collision"] = self.collision_log[self.collision_cnt-1]
+            self.collision_cnt += 1
+
+        if self.invasion_cnt < len(self.invasion_log):
+            data["invasion"] = self.invasion_log[self.invasion_cnt-1]
+            self.invasion_cnt += 1
+
+        if self.obstacle_cnt < len(self.obstacle_log):
+            data["front_distance"] = self.obstacle_log[self.obstacle_cnt-1]["front_distance"]
+            data["front_object"] = self.obstacle_log[self.obstacle_cnt - 1]["front_object"]
+            self.obstacle_cnt += 1
+
+        mqtt_publisher.publish(data)
+        #iot_publisher.publish(data)
 
 # ==============================================================================
 # -- KeyboardControl -----------------------------------------------------------
@@ -871,7 +498,6 @@ class KeyboardControl(object):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
-        self._ignition_on = False # Add ignition state
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
@@ -895,19 +521,7 @@ class KeyboardControl(object):
                 return True
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
-                    if world.show_analytics_dashboard:
-                        # 대시보드가 표시 중이면 닫기
-                        world.show_analytics_dashboard = False
-                    else:
-                        # 아니면 종료
-                        return True
-                        
-                elif event.key == K_F2:  # F2키로 안전 대시보드 표시
-                    # 세션 종료 및 분석 수행
-                    world.analytics.end_session()
-                    world.show_analytics_dashboard = not world.show_analytics_dashboard
-                
-                # 기존 코드...
+                    return True
                 elif event.key == K_BACKSPACE:
                     if self._autopilot_enabled:
                         world.player.set_autopilot(False)
@@ -988,6 +602,11 @@ class KeyboardControl(object):
                         client.start_recorder("manual_recording.rec")
                         world.recording_enabled = True
                         world.hud.notification("Recorder is ON")
+                elif event.key == K_p and (pygame.key.get_mods() & KMOD_CTRL):
+                    # stop recorder
+                    client.stop_recorder()
+                    world.recording_enabled = False
+                    # work around to fix camera at start of replaying
                     current_index = world.camera_manager.index
                     world.destroy_sensors()
                     # disable autopilot
@@ -1009,9 +628,6 @@ class KeyboardControl(object):
                     else:
                         world.recording_start += 1
                     world.hud.notification("Recording start time is %d" % (world.recording_start))
-                elif event.key == K_e: # Add ignition toggle key
-                    self._ignition_on = not self._ignition_on
-                    world.hud.notification('Ignition %s' % ('On' if self._ignition_on else 'Off'))
                 if isinstance(self._control, carla.VehicleControl):
                     if event.key == K_f:
                         # Toggle ackermann controller
@@ -1089,14 +705,8 @@ class KeyboardControl(object):
                     world.player.set_light_state(carla.VehicleLightState(self._lights))
                 # Apply control
                 if not self._ackermann_enabled:
-                    # Apply ignition state check before applying control
-                    if not self._ignition_on:
-                        self._control.throttle = 0.0 # Force throttle to 0 if ignition is off
                     world.player.apply_control(self._control)
                 else:
-                    # Apply ignition state check for Ackermann too if needed
-                    if not self._ignition_on:
-                         self._ackermann_control.speed = 0 # Or handle speed differently
                     world.player.apply_ackermann_control(self._ackermann_control)
                     # Update control to the last one applied by the ackermann controller.
                     self._control = world.player.get_control()
@@ -1108,21 +718,15 @@ class KeyboardControl(object):
                 world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
-        throttle_input = 0.0
-        if self._ignition_on: # Only allow throttle calculation if ignition is on
-            if keys[K_UP] or keys[K_w]:
-                if not self._ackermann_enabled:
-                    # Calculate desired throttle but don't apply yet
-                    throttle_input = min(self._control.throttle + 0.1, 1.00)
-                else:
-                    self._ackermann_control.speed += round(milliseconds * 0.005, 2) * self._ackermann_reverse
-            # else: throttle_input remains 0.0
+        if keys[K_UP] or keys[K_w]:
+            if not self._ackermann_enabled:
+                self._control.throttle = min(self._control.throttle + 0.1, 1.00)
+            else:
+                self._ackermann_control.speed += round(milliseconds * 0.005, 2) * self._ackermann_reverse
+        else:
+            if not self._ackermann_enabled:
+                self._control.throttle = 0.0
 
-        # Apply calculated throttle (or 0 if ignition off)
-        if not self._ackermann_enabled:
-             self._control.throttle = throttle_input # Apply the potentially modified throttle
-
-        # Brake logic (always allowed)
         if keys[K_DOWN] or keys[K_s]:
             if not self._ackermann_enabled:
                 self._control.brake = min(self._control.brake + 0.2, 1)
@@ -1133,7 +737,6 @@ class KeyboardControl(object):
             if not self._ackermann_enabled:
                 self._control.brake = 0
 
-        # Steering logic (always allowed)
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
             if self._steer_cache > 0:
@@ -1148,7 +751,6 @@ class KeyboardControl(object):
         else:
             self._steer_cache = 0.0
         self._steer_cache = min(0.7, max(-0.7, self._steer_cache))
-
         if not self._ackermann_enabled:
             self._control.steer = round(self._steer_cache, 1)
             self._control.hand_brake = keys[K_SPACE]
@@ -1396,8 +998,10 @@ class HelpText(object):
 
 
 class CollisionSensor(object):
-    def __init__(self, parent_actor, hud):
+    def __init__(self, parent_actor, hud, log):
         self.sensor = None
+        self.log = log
+
         self.history = []
         self._parent = parent_actor
         self.hud = hud
@@ -1427,6 +1031,9 @@ class CollisionSensor(object):
         self.history.append((event.frame, intensity))
         if len(self.history) > 4000:
             self.history.pop(0)
+        self.log.append({
+            "actor_type": actor_type
+        })
 
 
 # ==============================================================================
@@ -1435,8 +1042,9 @@ class CollisionSensor(object):
 
 
 class LaneInvasionSensor(object):
-    def __init__(self, parent_actor, hud):
+    def __init__(self, parent_actor, hud, log):
         self.sensor = None
+        self.log = log
 
         # If the spawn object is not a vehicle, we cannot use the Lane Invasion Sensor
         if parent_actor.type_id.startswith("vehicle."):
@@ -1458,6 +1066,48 @@ class LaneInvasionSensor(object):
         lane_types = set(x.type for x in event.crossed_lane_markings)
         text = ['%r' % str(x).split()[-1] for x in lane_types]
         self.hud.notification('Crossed line %s' % ' and '.join(text))
+        self.log.append({
+            "cross_line": text
+        })
+
+# ==============================================================================
+# -- ObstacleSensor ------------------------------------------------------------
+# ==============================================================================
+
+
+class ObstacleSensor(object):
+    def __init__(self, parent_actor, hud, log):
+        self.sensor = None
+        self.log = log
+        self.timer = time.time()
+        self.obstacle_history = []
+
+        self._parent = parent_actor
+        self.hud = hud
+        world = self._parent.get_world()
+        bp = world.get_blueprint_library().find('sensor.other.obstacle')
+        bp.set_attribute('distance', '100.0')
+        self.sensor = world.spawn_actor(bp, carla.Transform(), attach_to=self._parent)
+        weak_self = weakref.ref(self)
+        self.sensor.listen(lambda event: ObstacleSensor._on_obstacle(weak_self, event))
+
+    @staticmethod
+    def _on_obstacle(weak_self, event):
+        self = weak_self()
+        if not self:
+            return
+        if event.distance > 1:
+            if event.other_actor.id != 0:
+                now = time.time()
+                if now - self.timer > 0.8:
+                    self.log.append({
+                        "front_object" : str(event.other_actor.type_id),
+                        "front_distance": event.distance
+                    })
+                    print(event.other_actor, event.distance)
+                    self.timer = now
+
+
 
 
 # ==============================================================================
@@ -1523,8 +1173,7 @@ class IMUSensor(object):
         self.gyroscope = (
             max(limits[0], min(limits[1], math.degrees(sensor_data.gyroscope.x))),
             max(limits[0], min(limits[1], math.degrees(sensor_data.gyroscope.y))),
-            max(limits[0], min(limits[1], math.degrees(sensor_data.gyroscope.z)))
-        )
+            max(limits[0], min(limits[1], math.degrees(sensor_data.gyroscope.z))))
         self.compass = math.degrees(sensor_data.compass)
 
 
@@ -1710,10 +1359,7 @@ class CameraManager(object):
         self = weak_self()
         if not self:
             return
-        # Add this print statement
-        # print(f"Received image: {image.frame}, Sensor type: {self.sensors[self.index][0]}") 
         if self.sensors[self.index][0].startswith('sensor.lidar'):
-            # ... existing lidar code ...
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
             points = np.reshape(points, (int(points.shape[0] / 4), 4))
             lidar_data = np.array(points[:, :2])
@@ -1727,7 +1373,8 @@ class CameraManager(object):
             lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
             self.surface = pygame.surfarray.make_surface(lidar_img)
         elif self.sensors[self.index][0].startswith('sensor.camera.dvs'):
-            # ... existing dvs code ...
+            # Example of converting the raw_data from a carla.DVSEventArray
+            # sensor into a NumPy array and using it as an image
             dvs_events = np.frombuffer(image.raw_data, dtype=np.dtype([
                 ('x', np.uint16), ('y', np.uint16), ('t', np.int64), ('pol', np.bool)]))
             dvs_img = np.zeros((image.height, image.width, 3), dtype=np.uint8)
@@ -1735,27 +1382,19 @@ class CameraManager(object):
             dvs_img[dvs_events[:]['y'], dvs_events[:]['x'], dvs_events[:]['pol'] * 2] = 255
             self.surface = pygame.surfarray.make_surface(dvs_img.swapaxes(0, 1))
         elif self.sensors[self.index][0].startswith('sensor.camera.optical_flow'):
-            # ... existing optical flow code ...
             image = image.get_color_coded_flow()
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (image.height, image.width, 4))
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        else: # Default RGB camera and others
+        else:
             image.convert(self.sensors[self.index][1])
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (image.height, image.width, 4))
             array = array[:, :, :3]
             array = array[:, :, ::-1]
-            try:
-                self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-                # Add this print statement
-                # print("Surface created successfully.") 
-            except Exception as e:
-                print(f"Error creating surface: {e}")
-                self.surface = None
-
+            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         if self.recording:
             image.save_to_disk('_out/%08d' % image.frame)
 
@@ -1764,173 +1403,50 @@ class CameraManager(object):
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
 
+world = None
+event_producer = None
+mqtt_publisher = None
+iot_publisher = None
 
-def game_loop(args):
-    pygame.init()
-    pygame.font.init()
-    world = None
-    original_settings = None
-
-    try:
-        client = carla.Client(args.host, args.port) # client object is created here
-        client.set_timeout(2000.0)
-
-        sim_world = client.get_world()
-        if args.sync:
-            original_settings = sim_world.get_settings()
-            settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
-            sim_world.apply_settings(settings)
-
-            traffic_manager = client.get_trafficmanager()
-            traffic_manager.set_synchronous_mode(True)
-
-        if args.autopilot and not sim_world.get_settings().synchronous_mode:
-            print("WARNING: You are currently in asynchronous mode and could "
-                  "experience some issues with the traffic simulation")
-
-        display = pygame.display.set_mode(
-            (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF)
-        display.fill((0,0,0))
-        pygame.display.flip()
-
-        hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, args, client) # Pass client to World constructor
-        controller = KeyboardControl(world, args.autopilot)
-
-        # <<<--- 차량 스폰 함수 호출 추가 --->>>
-        if args.number_of_vehicles > 0:
-            # Pass client to spawn_traffic_vehicles if not storing in World
-            # world.spawn_traffic_vehicles(args.number_of_vehicles, client)
-            world.spawn_traffic_vehicles(args.number_of_vehicles) # Now uses self.client internally
-        # <<<------------------------------->>>
-
-        if args.sync:
-            sim_world.tick()
+async def sensor_periodic_logger():
+    global world
+    while True:
+        if world == None:
+            pass
         else:
-            sim_world.wait_for_tick()
+            world.sensor_log("sensor_log.json")
+        await asyncio.sleep(1)
 
-        clock = pygame.time.Clock()
-        while True:
-            if args.sync:
-                sim_world.tick()
-            clock.tick_busy_loop(60)
-            
-            should_quit = controller.parse_events(client, world, clock, args.sync)
-            
-            # ESC 키를 눌렀을 때
-            if should_quit:
-                # 대시보드가 이미 표시 중이면 실제로 종료
-                if world.show_analytics_dashboard:
-                    return
-                else:
-                    # 대시보드 표시 전이면 분석 결과 표시
-                    world.analytics.end_session()
-                    world.show_analytics_dashboard = True
-                    
-            world.tick(clock)
-            world.render(display)
-            pygame.display.flip()
+async def event_periodic_logger():
+    global world
+    while True:
+        if world == None:
+            pass
+        else:
+            world.event_log("event_log.json")
+        await asyncio.sleep(1)
 
-    finally:
+async def event_producer_loop():
+    global event_producer
+    while True:
+        if event_producer == None:
+            pass
+        else:
+            event_producer.checking()
+        await asyncio.sleep(1)
 
-        if original_settings:
-            sim_world.apply_settings(original_settings)
+async def sensor_publisher():
+    global world
 
-        if (world and world.recording_enabled):
-            client.stop_recorder()
+    user_id = str(uuid.uuid4())
+    start_time = datetime.datetime.now().replace(microsecond=0).isoformat()
 
-        if world is not None:
-            world.destroy()
+    while True:
+        if world == None:
+            pass
+        else:
+            world.sensor_publish(user_id, start_time)
+        await asyncio.sleep(1)
 
-        pygame.quit()
-
-
-# ==============================================================================
-# -- main() --------------------------------------------------------------------
-# ==============================================================================
-
-
-def main():
-    argparser = argparse.ArgumentParser(
-        description='CARLA Manual Control Client')
-    argparser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        dest='debug',
-        help='print debug information')
-    argparser.add_argument(
-        '--host',
-        metavar='H',
-        default='127.0.0.1',
-        help='IP of the host server (default: 127.0.0.1)')
-    argparser.add_argument(
-        '-p', '--port',
-        metavar='P',
-        default=2000,
-        type=int,
-        help='TCP port to listen to (default: 2000)')
-    argparser.add_argument(
-        '-a', '--autopilot',
-        action='store_true',
-        help='enable autopilot')
-    argparser.add_argument(
-        '--res',
-        metavar='WIDTHxHEIGHT',
-        default='1280x720',
-        help='window resolution (default: 1280x720)')
-    argparser.add_argument(
-        '--filter',
-        metavar='PATTERN',
-        default='vehicle.*',
-        help='actor filter (default: "vehicle.*")')
-    argparser.add_argument(
-        '--generation',
-        metavar='G',
-        default='2',
-        help='restrict to certain actor generation (values: "1","2","All" - default: "2")')
-    argparser.add_argument(
-        '--rolename',
-        metavar='NAME',
-        default='hero',
-        help='actor role name (default: "hero")')
-    argparser.add_argument(
-        '--gamma',
-        default=2.2,
-        type=float,
-        help='Gamma correction of the camera (default: 2.2)')
-    argparser.add_argument(
-        '--sync',
-        action='store_true',
-        help='Activate synchronous mode execution')
-    argparser.add_argument(
-        '--number-of-vehicles',
-        metavar='N',
-        default=0,
-        type=int,
-        help='number of vehicles to spawn (default: 0)')
-    args = argparser.parse_args()
-
-    args.width, args.height = [int(x) for x in args.res.split('x')]
-
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
-
-    logging.info('listening to server %s:%s', args.host, args.port)
-
-    print(__doc__)
-
-    try:
-
-        game_loop(args)
-
-    except KeyboardInterrupt:
-        print('\nCancelled by user. Bye!')
-
-
-if __name__ == '__main__':
-
-    main()
+async def game_loop(args):
+    global world, event_pro
