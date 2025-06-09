@@ -120,6 +120,7 @@ try:
     from pygame.locals import K_b
     from pygame.locals import K_c
     from pygame.locals import K_d
+    from pygame.locals import K_e  # E 키 추가
     from pygame.locals import K_f
     from pygame.locals import K_g
     from pygame.locals import K_h
@@ -498,6 +499,7 @@ class KeyboardControl(object):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
+        self._engine_started = False  # 시동 상태 변수 추가 (기본값은 꺼진 상태)
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
@@ -507,7 +509,7 @@ class KeyboardControl(object):
         elif isinstance(world.player, carla.Walker):
             self._control = carla.WalkerControl()
             self._autopilot_enabled = False
-            self._rotation = world.player.get_transform().rotation
+            self._rotation = world.player.get_transform()
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
@@ -522,7 +524,19 @@ class KeyboardControl(object):
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
-                elif event.key == K_BACKSPACE:
+                # 여기에 E 키 처리 추가
+            elif event.key == K_e:
+                self._engine_started = not self._engine_started
+                if self._engine_started:
+                    world.hud.notification('Engine Started')
+                else:
+                    # 시동이 꺼질 때 속도 및 제어값 초기화
+                    self._control.throttle = 0.0
+                    self._control.brake = 1.0  # 완전히 정지
+                    if not self._autopilot_enabled:
+                        world.player.apply_control(self._control)
+                    world.hud.notification('Engine Stopped')
+            elif event.key == K_BACKSPACE:
                     if self._autopilot_enabled:
                         world.player.set_autopilot(False)
                         world.restart()
@@ -691,6 +705,14 @@ class KeyboardControl(object):
             if isinstance(self._control, carla.VehicleControl):
                 self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
                 self._control.reverse = self._control.gear < 0
+                
+                # 시동이 꺼진 경우 제어 무시
+                if not self._engine_started:
+                    self._control.throttle = 0.0
+                    self._control.steer = 0.0
+                    self._control.brake = 1.0
+                    self._control.hand_brake = True
+                    
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
                     current_lights |= carla.VehicleLightState.Brake
@@ -707,6 +729,9 @@ class KeyboardControl(object):
                 if not self._ackermann_enabled:
                     world.player.apply_control(self._control)
                 else:
+                    # 시동이 꺼진 경우 ackermann 속도도 0으로 설정
+                    if not self._engine_started:
+                        self._ackermann_control.speed = 0.0
                     world.player.apply_ackermann_control(self._ackermann_control)
                     # Update control to the last one applied by the ackermann controller.
                     self._control = world.player.get_control()
@@ -1449,4 +1474,28 @@ async def sensor_publisher():
         await asyncio.sleep(1)
 
 async def game_loop(args):
-    global world, event_pro
+    global world, event_producer, mqtt_publisher, iot_publisher
+
+    pygame.init()
+    try:
+        client = carla.Client(args.host, args.port)
+        client.set_timeout(10.0)
+        world = World(client.get_world(), hud=HUD(800, 600), args=args)
+        event_producer = MQTTPublisher()
+        mqtt_publisher = MQTTPublisher()
+        iot_publisher = MQTTPublisher()
+        loop = asyncio.get_running_loop()
+        loop.create_task(sensor_periodic_logger())
+        loop.create_task(event_periodic_logger())
+        loop.create_task(event_producer_loop())
+        loop.create_task(sensor_publisher())
+        print("INFO: CARLA is running in %s mode." % ("Synchronous" if args.sync else "Asynchronous"))
+        print("INFO: Press 'H' or '?' for help.")
+        while True:
+            world.tick(pygame.time.get_ticks())
+            world.render(pygame.display.get_surface())
+            pygame.display.flip()
+    finally:
+        pygame.quit()
+        if world is not None:
+            world.destroy()
