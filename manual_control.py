@@ -120,7 +120,6 @@ try:
     from pygame.locals import K_b
     from pygame.locals import K_c
     from pygame.locals import K_d
-    from pygame.locals import K_e  # E 키 추가
     from pygame.locals import K_f
     from pygame.locals import K_g
     from pygame.locals import K_h
@@ -451,8 +450,8 @@ class World(object):
         
         
         data = {
-            "userId": user_id,
-            "driveId": drive_id,
+            "userId": user_id,# user_id,
+            "driveId": drive_id,  # drive_id,
             "time": datetime.datetime.now().isoformat(),
             "velocity": 3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2),
             'Accelero_x': self.imu_sensor.accelerometer[0],
@@ -499,7 +498,9 @@ class KeyboardControl(object):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
-        self._engine_started = False  # 시동 상태 변수 추가 (기본값은 꺼진 상태)
+
+        self.engine_on = True
+
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
@@ -509,11 +510,43 @@ class KeyboardControl(object):
         elif isinstance(world.player, carla.Walker):
             self._control = carla.WalkerControl()
             self._autopilot_enabled = False
-            self._rotation = world.player.get_transform()
+            self._rotation = world.player.get_transform().rotation
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
+
+    def on_engine_off(self, world):
+        world.hud.notification('Engine OFF!')
+        # 차량 제어를 모두 0으로
+        if hasattr(self, '_control'):
+            self._control.throttle = 0.0
+            self._control.brake = 1.0
+            self._control.steer = 0.0
+            world.player.apply_control(self._control)
+
+        if drive_id == None:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "drive_id is required"})
+            }
+        
+        url = f"http://modive.site:8083/analysis/{drive_id}"
+        
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  # HTTP 에러 처리
+            data = response.json()
+        except requests.RequestException as e:
+            return {
+                "statusCode": 500,
+                "body": json.dumps({"error": str(e)})
+            }
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps(data)
+        }
 
     def parse_events(self, client, world, clock, sync_mode):
         if isinstance(self._control, carla.VehicleControl):
@@ -524,20 +557,14 @@ class KeyboardControl(object):
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
-                elif event.key == K_e:
-                    self._engine_started = not self._engine_started
-                    if self._engine_started:
-                        world.hud.notification('Engine Started')
+                
+                elif event.key == pygame.K_e:
+                    self.engine_on = not self.engine_on
+                    if not self.engine_on:
+                        self.on_engine_off(world)
                     else:
-                        # 시동이 꺼질 때 속도 및 제어값 초기화
-                        self._control.throttle = 0.0
-                        self._control.brake = 1.0  # 완전히 정지
+                        world.hud.notification('Engine ON!')
 
-                        print(self.on_ignition_off(world))
-
-                        if not self._autopilot_enabled:
-                            world.player.apply_control(self._control)
-                        world.hud.notification('Engine Stopped')
                 elif event.key == K_BACKSPACE:
                     if self._autopilot_enabled:
                         world.player.set_autopilot(False)
@@ -650,7 +677,7 @@ class KeyboardControl(object):
                         self._ackermann_enabled = not self._ackermann_enabled
                         world.hud.show_ackermann_info(self._ackermann_enabled)
                         world.hud.notification("Ackermann Controller %s" %
-                                                ("Enabled" if self._ackermann_enabled else "Disabled"))
+                                               ("Enabled" if self._ackermann_enabled else "Disabled"))
                     if event.key == K_q:
                         if not self._ackermann_enabled:
                             self._control.gear = 1 if self._control.reverse else -1
@@ -662,7 +689,7 @@ class KeyboardControl(object):
                         self._control.manual_gear_shift = not self._control.manual_gear_shift
                         self._control.gear = world.player.get_control().gear
                         world.hud.notification('%s Transmission' %
-                                                ('Manual' if self._control.manual_gear_shift else 'Automatic'))
+                                               ('Manual' if self._control.manual_gear_shift else 'Automatic'))
                     elif self._control.manual_gear_shift and event.key == K_COMMA:
                         self._control.gear = max(-1, self._control.gear - 1)
                     elif self._control.manual_gear_shift and event.key == K_PERIOD:
@@ -670,7 +697,7 @@ class KeyboardControl(object):
                     elif event.key == K_p and not pygame.key.get_mods() & KMOD_CTRL:
                         if not self._autopilot_enabled and not sync_mode:
                             print("WARNING: You are currently in asynchronous mode and could "
-                                    "experience some issues with the traffic simulation")
+                                  "experience some issues with the traffic simulation")
                         self._autopilot_enabled = not self._autopilot_enabled
                         world.player.set_autopilot(self._autopilot_enabled)
                         world.hud.notification(
@@ -707,14 +734,6 @@ class KeyboardControl(object):
             if isinstance(self._control, carla.VehicleControl):
                 self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
                 self._control.reverse = self._control.gear < 0
-                
-                # 시동이 꺼진 경우 제어 무시
-                if not self._engine_started:
-                    self._control.throttle = 0.0
-                    self._control.steer = 0.0
-                    self._control.brake = 1.0
-                    self._control.hand_brake = True
-                    
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
                     current_lights |= carla.VehicleLightState.Brake
@@ -731,9 +750,6 @@ class KeyboardControl(object):
                 if not self._ackermann_enabled:
                     world.player.apply_control(self._control)
                 else:
-                    # 시동이 꺼진 경우 ackermann 속도도 0으로 설정
-                    if not self._engine_started:
-                        self._ackermann_control.speed = 0.0
                     world.player.apply_ackermann_control(self._ackermann_control)
                     # Update control to the last one applied by the ackermann controller.
                     self._control = world.player.get_control()
@@ -745,6 +761,12 @@ class KeyboardControl(object):
                 world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
+        if not self.engine_on:
+            self._control.throttle = 0.0
+            self._control.brake = 1.0
+            self._control.steer = 0.0
+            return
+         
         if keys[K_UP] or keys[K_w]:
             if not self._ackermann_enabled:
                 self._control.throttle = min(self._control.throttle + 0.1, 1.00)
@@ -799,34 +821,6 @@ class KeyboardControl(object):
         self._control.jump = keys[K_SPACE]
         self._rotation.yaw = round(self._rotation.yaw, 1)
         self._control.direction = self._rotation.get_forward_vector()
-
-    def on_ignition_off(self):
-        """
-        시동이 꺼졌을 때 실행되는 함수.
-        """
-
-        if drive_id == None:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "drive_id is required"})
-            }
-        
-        url = f"http://modive.site:8083/analysis/{drive_id}"
-        
-        try:
-            response = requests.get(url)
-            response.raise_for_status()  # HTTP 에러 처리
-            data = response.json()
-        except requests.RequestException as e:
-            return {
-                "statusCode": 500,
-                "body": json.dumps({"error": str(e)})
-            }
-
-        return {
-            "statusCode": 200,
-            "body": json.dumps(data)
-        }
 
     @staticmethod
     def _is_quit_shortcut(key):
@@ -1494,7 +1488,6 @@ async def event_producer_loop():
 async def sensor_publisher():
     global world
     global drive_id
-
     user_id = str(uuid.uuid4())
     start_time = datetime.datetime.now().replace(microsecond=0).isoformat()
     drive_id = f"{user_id[:8]}_{start_time}"
