@@ -1514,25 +1514,157 @@ async def game_loop(args):
     global world, event_producer, mqtt_publisher, iot_publisher
 
     pygame.init()
+    pygame.font.init()
+    # world = None
+    original_settings = None
+
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(10.0)
-        world = World(client.get_world(), hud=HUD(800, 600), args=args)
-        event_producer = MQTTPublisher()
+        client.set_timeout(2000.0)
+
+        sim_world = client.get_world()
+        if args.sync:
+            original_settings = sim_world.get_settings()
+            settings = sim_world.get_settings()
+            if not settings.synchronous_mode:
+                settings.synchronous_mode = True
+                settings.fixed_delta_seconds = 0.05
+            sim_world.apply_settings(settings)
+
+            traffic_manager = client.get_trafficmanager()
+            traffic_manager.set_synchronous_mode(True)
+
+        if args.autopilot and not sim_world.get_settings().synchronous_mode:
+            print("WARNING: You are currently in asynchronous mode and could "
+                  "experience some issues with the traffic simulation")
+
+        display = pygame.display.set_mode(
+            (args.width, args.height),
+            pygame.HWSURFACE | pygame.DOUBLEBUF)
+        display.fill((0,0,0))
+        pygame.display.flip()
+
+        hud = HUD(args.width, args.height)
         mqtt_publisher = MQTTPublisher()
-        iot_publisher = MQTTPublisher()
-        loop = asyncio.get_running_loop()
-        loop.create_task(sensor_periodic_logger())
-        loop.create_task(event_periodic_logger())
-        loop.create_task(event_producer_loop())
-        loop.create_task(sensor_publisher())
-        print("INFO: CARLA is running in %s mode." % ("Synchronous" if args.sync else "Asynchronous"))
-        print("INFO: Press 'H' or '?' for help.")
+
+        world = World(sim_world, hud, args)
+        controller = KeyboardControl(world, args.autopilot)
+
+        if args.sync:
+            sim_world.tick()
+        else:
+            sim_world.wait_for_tick()
+
+        clock = pygame.time.Clock()
         while True:
-            world.tick(pygame.time.get_ticks())
-            world.render(pygame.display.get_surface())
+            if args.sync:
+                sim_world.tick()
+            clock.tick_busy_loop(60)
+            if controller.parse_events(client, world, clock, args.sync):
+                return
+
+            world.tick(clock)
+            world.render(display)
             pygame.display.flip()
+
+            await asyncio.sleep(0.1)
+
     finally:
-        pygame.quit()
+
+        if original_settings:
+            sim_world.apply_settings(original_settings)
+
+        if (world and world.recording_enabled):
+            client.stop_recorder()
+
         if world is not None:
             world.destroy()
+
+        pygame.quit()
+
+
+# ==============================================================================
+# -- main() --------------------------------------------------------------------
+# ==============================================================================
+
+
+async def main():
+
+
+    argparser = argparse.ArgumentParser(
+        description='CARLA Manual Control Client')
+    argparser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        dest='debug',
+        help='print debug information')
+    argparser.add_argument(
+        '--host',
+        metavar='H',
+        default='127.0.0.1',
+        help='IP of the host server (default: 127.0.0.1)')
+    argparser.add_argument(
+        '-p', '--port',
+        metavar='P',
+        default=2000,
+        type=int,
+        help='TCP port to listen to (default: 2000)')
+    argparser.add_argument(
+        '-a', '--autopilot',
+        action='store_true',
+        help='enable autopilot')
+    argparser.add_argument(
+        '--res',
+        metavar='WIDTHxHEIGHT',
+        default='1280x720',
+        help='window resolution (default: 1280x720)')
+    argparser.add_argument(
+        '--filter',
+        metavar='PATTERN',
+        default='vehicle.*',
+        help='actor filter (default: "vehicle.*")')
+    argparser.add_argument(
+        '--generation',
+        metavar='G',
+        default='2',
+        help='restrict to certain actor generation (values: "1","2","All" - default: "2")')
+    argparser.add_argument(
+        '--rolename',
+        metavar='NAME',
+        default='hero',
+        help='actor role name (default: "hero")')
+    argparser.add_argument(
+        '--gamma',
+        default=2.2,
+        type=float,
+        help='Gamma correction of the camera (default: 2.2)')
+    argparser.add_argument(
+        '--sync',
+        action='store_true',
+        help='Activate synchronous mode execution')
+    args = argparser.parse_args()
+
+    args.width, args.height = [int(x) for x in args.res.split('x')]
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
+
+    logging.info('listening to server %s:%s', args.host, args.port)
+
+    print(__doc__)
+
+    try:
+        #asyncio.create_task(sensor_periodic_logger())
+        #asyncio.create_task(event_periodic_logger())
+        #asyncio.create_task(event_producer_loop())
+        asyncio.create_task(sensor_publisher())
+
+        await game_loop(args)
+
+    except KeyboardInterrupt:
+        print('\nCancelled by user. Bye!')
+
+
+if __name__ == '__main__':
+
+    asyncio.run(main())
